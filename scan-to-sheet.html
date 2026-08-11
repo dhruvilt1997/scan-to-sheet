@@ -143,6 +143,16 @@
     text-align:center;font-family:var(--mono);font-size:12px;color:var(--muted);
     margin-top:10px;
   }
+  .scan-controls{margin-top:12px;}
+  .scan-controls .btn{width:100%;}
+  .idle-overlay{
+    position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    background:var(--panel-2);
+  }
+  .idle-overlay span{
+    font-family:var(--mono);font-size:12px;color:var(--muted);
+    letter-spacing:.06em;text-transform:uppercase;
+  }
 
   /* Bottom sheet */
   .sheet-overlay{
@@ -248,15 +258,21 @@
       <div class="scanner-shell">
         <div id="reader"></div>
         <div class="scan-flash" id="scanFlash"></div>
-        <div class="reticle">
+        <div class="reticle hidden" id="reticle">
           <div class="reticle-box">
             <div class="corner tl"></div><div class="corner tr"></div>
             <div class="corner bl"></div><div class="corner br"></div>
             <div class="laser-line"></div>
           </div>
         </div>
+        <div class="idle-overlay" id="idleOverlay">
+          <span>Camera is off</span>
+        </div>
       </div>
-      <div class="scan-hint">Point the camera at a barcode or QR code</div>
+      <div class="scan-controls">
+        <button class="btn btn-primary" id="toggleScanBtn">Start Scanning</button>
+      </div>
+      <div class="scan-hint" id="scanHint">Tap "Start Scanning" to open the camera</div>
     </div>
 
     <div class="log-title">Recent scans</div>
@@ -514,29 +530,65 @@
   function enterScanMode(){
     hide('sheetCard');
     show('scanSection');
-    startScanning();
+    setIdleUI();
+  }
+
+  function setIdleUI(){
+    show('idleOverlay');
+    el('reticle').classList.add('hidden');
+    el('toggleScanBtn').textContent = 'Start Scanning';
+    el('toggleScanBtn').disabled = false;
+    el('scanHint').textContent = 'Tap "Start Scanning" to open the camera';
+  }
+
+  function setActiveUI(){
+    hide('idleOverlay');
+    el('reticle').classList.remove('hidden');
+    el('toggleScanBtn').textContent = 'Stop Scanning';
+    el('toggleScanBtn').disabled = false;
+    el('scanHint').textContent = 'Point the camera at a barcode or QR code';
   }
 
   function startScanning(){
     if(scanning) return;
-    html5QrCode = new Html5Qrcode('reader');
+    el('toggleScanBtn').disabled = true;
+    el('toggleScanBtn').textContent = 'Opening camera…';
+    if(!html5QrCode) html5QrCode = new Html5Qrcode('reader');
     html5QrCode.start(
       { facingMode: 'environment' },
       { fps: 10, qrbox: { width: 260, height: 170 } },
       (decodedText)=> onScanSuccess(decodedText),
       ()=>{ /* ignore per-frame decode misses */ }
-    ).then(()=>{ scanning = true; })
+    ).then(()=>{ scanning = true; setActiveUI(); })
      .catch(err=>{
-        el('readyText').textContent = 'Camera access needed — check browser permissions';
+        setIdleUI();
+        el('scanHint').textContent = 'Camera access needed — check browser permissions';
      });
   }
 
   function stopScanning(){
     if(html5QrCode && scanning){
-      html5QrCode.stop().catch(()=>{});
-      scanning = false;
+      html5QrCode.stop().then(()=>{
+        return html5QrCode.clear();
+      }).catch(()=>{});
     }
+    scanning = false;
   }
+
+  el('toggleScanBtn').addEventListener('click', ()=>{
+    if(scanning){ stopScanning(); setIdleUI(); }
+    else { startScanning(); }
+  });
+
+  // Release the camera when the tab/app is backgrounded instead of letting
+  // the stream die mid-scan and error out. User taps "Start Scanning" again
+  // on return — no reconnect needed unless the browser fully reloaded the page.
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.hidden && scanning && !pendingCode){
+      stopScanning();
+      setIdleUI();
+    }
+  });
 
   function onScanSuccess(text){
     if(pendingCode) return; // form already open
