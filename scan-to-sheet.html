@@ -146,6 +146,28 @@
   }
   .scan-controls{margin-top:12px;}
   .scan-controls .btn{width:100%;}
+
+  .zoom-row{
+    display:flex;align-items:center;gap:10px;margin-top:10px;padding:0 2px;
+  }
+  .zoom-row span{font-family:var(--mono);font-size:11px;color:var(--muted);min-width:30px;}
+  .zoom-row span.zoom-val{text-align:right;color:var(--text);}
+  .zoom-row input[type=range]{
+    flex:1;-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;
+    background:var(--line);outline:none;
+  }
+  .zoom-row input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none;appearance:none;width:20px;height:20px;border-radius:50%;
+    background:var(--confirm);border:2px solid #06170a;cursor:pointer;
+  }
+  .zoom-row input[type=range]::-moz-range-thumb{
+    width:20px;height:20px;border-radius:50%;background:var(--confirm);
+    border:2px solid #06170a;cursor:pointer;
+  }
+  .zoom-unsupported{
+    font-family:var(--mono);font-size:11px;color:var(--muted);text-align:center;
+    margin-top:8px;
+  }
   .mode-switch{
     display:flex;background:var(--panel-2);border:1px solid var(--line);
     border-radius:9px;padding:3px;margin-bottom:10px;gap:3px;
@@ -289,6 +311,13 @@
           <span>Camera is off</span>
         </div>
       </div>
+      <div class="zoom-row hidden" id="zoomRow">
+        <span>1x</span>
+        <input type="range" id="zoomSlider" min="0" max="1" step="0.01" value="0">
+        <span class="zoom-val" id="zoomVal">1.0x</span>
+      </div>
+      <div class="zoom-unsupported hidden" id="zoomUnsupported">Optical zoom not available on this camera/browser — move closer instead</div>
+
       <div class="scan-controls">
         <button class="btn btn-primary" id="toggleScanBtn">Start Scanning</button>
       </div>
@@ -370,6 +399,12 @@
   const CONFIRM_MATCHES = 3;    // identical reads needed before we accept a code
   const CONFIRM_WINDOW = 5;     // how many recent reads we keep in the buffer
   const MAX_AVG_ERROR = 0.12;   // Quagga's own per-read confidence — higher = noisier read, discard
+
+  // ---- Real hardware zoom (not CSS/digital zoom) ----
+  let currentTrack = null;      // the live MediaStreamTrack, however the active engine got it
+  let zoomCaps = null;          // { min, max, step } from track.getCapabilities().zoom
+  let pinchStartDist = null;
+  let pinchStartZoom = null;
 
   const el = id => document.getElementById(id);
 
@@ -582,14 +617,106 @@
     if(activeEngine === 'qr') startQrEngine(); else startBarcodeEngine();
   }
 
+  // Both engines end up attaching the live camera stream to a <video> tag
+  // inside #reader — grabbing the track from there (rather than reaching
+  // into each library's internals) works the same way for both engines.
+  function findLiveTrack(){
+    const video = document.querySelector('#reader video');
+    if(!video || !video.srcObject) return null;
+    const tracks = video.srcObject.getVideoTracks();
+    return tracks && tracks[0] ? tracks[0] : null;
+  }
+
+  // Poll briefly for the video element/track to actually mount — right
+  // after .start() resolves the stream is sometimes still attaching.
+  function attachZoomControl(attemptsLeft){
+    attemptsLeft = attemptsLeft === undefined ? 15 : attemptsLeft;
+    const track = findLiveTrack();
+    if(!track){
+      if(attemptsLeft > 0) setTimeout(()=> attachZoomControl(attemptsLeft-1), 150);
+      return;
+    }
+    currentTrack = track;
+
+    // Nudge continuous autofocus on if the device exposes it — digital/optical
+    // zoom makes focus errors much more visible, so this matters more once zoomed.
+    const caps = (typeof track.getCapabilities === 'function') ? track.getCapabilities() : {};
+    if(caps.focusMode && caps.focusMode.includes('continuous')){
+      track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(()=>{});
+    }
+
+    if(!caps.zoom || typeof caps.zoom.max !== 'number'){
+      zoomCaps = null;
+      hide('zoomRow');
+      show('zoomUnsupported');
+      return;
+    }
+
+    zoomCaps = { min: caps.zoom.min || 1, max: caps.zoom.max, step: caps.zoom.step || 0.1 };
+    const settings = (typeof track.getSettings === 'function') ? track.getSettings() : {};
+    const startZoom = settings.zoom || zoomCaps.min;
+
+    const slider = el('zoomSlider');
+    slider.min = zoomCaps.min;
+    slider.max = zoomCaps.max;
+    slider.step = zoomCaps.step;
+    slider.value = startZoom;
+    el('zoomVal').textContent = startZoom.toFixed(1) + 'x';
+    hide('zoomUnsupported');
+    show('zoomRow');
+  }
+
+  function applyZoom(value){
+    if(!currentTrack || !zoomCaps) return;
+    const clamped = Math.min(zoomCaps.max, Math.max(zoomCaps.min, value));
+    currentTrack.applyConstraints({ advanced: [{ zoom: clamped }] }).catch(()=>{});
+    el('zoomSlider').value = clamped;
+    el('zoomVal').textContent = clamped.toFixed(1) + 'x';
+  }
+
+  function teardownZoomControl(){
+    currentTrack = null;
+    zoomCaps = null;
+    pinchStartDist = null;
+    pinchStartZoom = null;
+    hide('zoomRow');
+    hide('zoomUnsupported');
+  }
+
+  el('zoomSlider').addEventListener('input', (e)=> applyZoom(parseFloat(e.target.value)));
+
+  // Pinch-to-zoom directly on the preview, mapped to real hardware zoom
+  // instead of a CSS transform — this is what actually sharpens the image.
+  const scannerShell = document.querySelector('.scanner-shell');
+  function touchDist(touches){
+    const dx = touches[0].clientX - touches[1].clientX;
+    const dy = touches[0].clientY - touches[1].clientY;
+    return Math.hypot(dx, dy);
+  }
+  scannerShell.addEventListener('touchstart', (e)=>{
+    if(e.touches.length === 2 && zoomCaps){
+      pinchStartDist = touchDist(e.touches);
+      pinchStartZoom = parseFloat(el('zoomSlider').value);
+    }
+  }, { passive:true });
+  scannerShell.addEventListener('touchmove', (e)=>{
+    if(e.touches.length === 2 && pinchStartDist && zoomCaps){
+      e.preventDefault();
+      const scale = touchDist(e.touches) / pinchStartDist;
+      const range = zoomCaps.max - zoomCaps.min;
+      applyZoom(pinchStartZoom + (scale - 1) * range * 0.6);
+    }
+  }, { passive:false });
+  scannerShell.addEventListener('touchend', ()=>{ pinchStartDist = null; });
+
   function startQrEngine(){
     if(!html5QrCode) html5QrCode = new Html5Qrcode('reader');
     html5QrCode.start(
-      { facingMode: 'environment' },
+      { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
       { fps: 10, qrbox: { width: 260, height: 170 } },
       (decodedText)=> onScanSuccess(decodedText),
       ()=>{ /* ignore per-frame decode misses */ }
-    ).then(()=>{ scanning = true; engineRunning = 'qr'; setActiveUI(); })
+    ).then(()=>{ scanning = true; engineRunning = 'qr'; setActiveUI(); attachZoomControl(); })
      .catch(()=>{
         setIdleUI();
         el('scanHint').textContent = 'Camera access needed — check browser permissions';
@@ -602,7 +729,7 @@
       inputStream: {
         type: 'LiveStream',
         target: el('reader'),
-        constraints: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+        constraints: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
       },
       locator: { patchSize: 'medium', halfSample: true },
       numOfWorkers: 2,
@@ -621,7 +748,7 @@
       Quagga.offDetected(quaggaDetected);
       Quagga.onDetected(quaggaDetected);
       Quagga.start();
-      scanning = true; engineRunning = 'barcode'; setActiveUI();
+      scanning = true; engineRunning = 'barcode'; setActiveUI(); attachZoomControl();
     });
   }
 
@@ -681,6 +808,7 @@
     engineRunning = null;
     scanning = false;
     confirmBuffer = [];
+    teardownZoomControl();
   }
 
   el('toggleScanBtn').addEventListener('click', ()=>{
