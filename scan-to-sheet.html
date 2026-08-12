@@ -107,7 +107,7 @@
 
   /* Scanner */
   .scanner-shell{
-    position:relative;touch-action:pan-y;border-radius:16px;overflow:hidden;background:#000;
+    position:relative;border-radius:16px;overflow:hidden;background:#000;touch-action:pan-y;
     aspect-ratio:3/4;border:1px solid var(--line);
   }
   #reader{width:100%;height:100%;}
@@ -322,7 +322,7 @@
         <button class="btn btn-primary" id="toggleScanBtn">Start Scanning</button>
       </div>
       <div class="scan-hint" id="scanHint">Tap "Start Scanning" to open the camera</div>
-      <div class="scan-hint" id="cameraNote" style="font-size:10.5px;margin-top:5px;">QR zoom uses the phone camera hardware when supported.</div>
+      <div class="scan-hint" style="font-size:10.5px;margin-top:5px;">QR zoom uses real camera zoom when supported.</div>
     </div>
 
     <div class="log-title">Recent scans</div>
@@ -713,6 +713,8 @@
   async function startQrEngine(){
     if(!html5QrCode) html5QrCode = new Html5Qrcode('reader');
 
+    // Use a square viewfinder. This is more reliable for QR codes than the
+    // old fixed 260x170 rectangle, especially on tall phone screens.
     const qrConfig = {
       fps: 12,
       qrbox: (viewfinderWidth, viewfinderHeight) => {
@@ -724,41 +726,48 @@
     };
 
     try{
-      // On some iPhones/mobile browsers, Html5Qrcode's direct facingMode
-      // constraint can fail to open the camera. First ask the browser for
-      // permission, then select the rear camera explicitly.
       let cameraId = null;
+      let probeStream = null;
 
+      // First explicitly request camera permission. Some mobile browsers
+      // will reject html5-qrcode's facingMode request unless permission has
+      // already been granted.
       if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
-        let probeStream = null;
         try{
           probeStream = await navigator.mediaDevices.getUserMedia({
             video: { facingMode: { ideal: 'environment' } },
             audio: false
           });
 
-          // getUserMedia permission is now granted; enumerate the actual
-          // camera devices and prefer a rear/environment camera.
+          // Once permission is granted, enumerate cameras and select the
+          // rear/environment camera when its label is available.
           const devices = await navigator.mediaDevices.enumerateDevices();
           const cameras = devices.filter(d => d.kind === 'videoinput');
           const rear = cameras.find(d =>
             /back|rear|environment|world/i.test(d.label)
           );
           cameraId = (rear || cameras[0] || {}).deviceId || null;
+        }catch(permissionErr){
+          console.warn('Initial camera permission probe failed:', permissionErr);
         }finally{
-          if(probeStream) probeStream.getTracks().forEach(t => t.stop());
+          if(probeStream){
+            probeStream.getTracks().forEach(track => track.stop());
+            probeStream = null;
+          }
         }
       }
 
-      const cameraSource = cameraId
+      // Prefer an exact camera ID after permission. Fall back to environment
+      // facingMode if the browser does not expose device IDs.
+      const cameraConfig = cameraId
         ? { deviceId: { exact: cameraId } }
         : { facingMode: { ideal: 'environment' } };
 
       await html5QrCode.start(
-        cameraSource,
+        cameraConfig,
         qrConfig,
-        (decodedText)=> onScanSuccess(decodedText),
-        ()=>{ /* ignore per-frame decode misses */ }
+        (decodedText) => onScanSuccess(decodedText),
+        () => {}
       );
 
       scanning = true;
@@ -768,9 +777,15 @@
 
     }catch(err){
       console.error('QR camera start failed:', err);
+      scanning = false;
+      engineRunning = null;
+      teardownZoomControl();
       setIdleUI();
+
+      const name = err && err.name ? ` (${err.name})` : '';
       el('scanHint').textContent =
-        'Camera could not open — allow camera access and use HTTPS (or localhost), then try again.';
+        'QR camera could not open' + name +
+        '. Allow camera access and open this page with HTTPS, then try again.';
     }
   }
 
