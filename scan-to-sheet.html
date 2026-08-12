@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/quagga@0.12.1/dist/quagga.min.js"></script>
 <style>
   :root{
     --bg:#0a0f0c;
@@ -145,6 +146,20 @@
   }
   .scan-controls{margin-top:12px;}
   .scan-controls .btn{width:100%;}
+  .mode-switch{
+    display:flex;background:var(--panel-2);border:1px solid var(--line);
+    border-radius:9px;padding:3px;margin-bottom:10px;gap:3px;
+  }
+  .mode-btn{
+    flex:1;border:none;background:transparent;color:var(--muted);
+    font-family:var(--mono);font-size:12px;letter-spacing:.04em;
+    padding:9px 6px;border-radius:6px;cursor:pointer;font-weight:500;
+  }
+  .mode-btn.active{background:var(--confirm);color:#06170a;font-weight:700;}
+  .mode-caption{
+    font-size:11.5px;color:var(--muted);text-align:center;margin:0 0 12px;
+    font-family:var(--sans);
+  }
   .idle-overlay{
     position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     background:var(--panel-2);
@@ -255,6 +270,11 @@
       <div class="status-line" style="margin-bottom:10px;padding:0 4px;">
         <span class="dot on"></span><span id="readyText">Connected · logging to your sheet</span>
       </div>
+      <div class="mode-switch">
+        <button class="mode-btn active" id="modeBarcodeBtn">Barcode</button>
+        <button class="mode-btn" id="modeQrBtn">QR Code</button>
+      </div>
+      <p class="mode-caption" id="modeCaption">Dedicated 1D-barcode engine — better for UPC/EAN in real-world lighting.</p>
       <div class="scanner-shell">
         <div id="reader"></div>
         <div class="scan-flash" id="scanFlash"></div>
@@ -344,6 +364,8 @@
   let html5QrCode = null;
   let scanning = false;
   let pendingCode = null;
+  let activeEngine = 'barcode'; // 'barcode' (Quagga) or 'qr' (html5-qrcode)
+  let engineRunning = null;     // which engine is actually live right now
 
   const el = id => document.getElementById(id);
 
@@ -553,25 +575,67 @@
     if(scanning) return;
     el('toggleScanBtn').disabled = true;
     el('toggleScanBtn').textContent = 'Opening camera…';
+    if(activeEngine === 'qr') startQrEngine(); else startBarcodeEngine();
+  }
+
+  function startQrEngine(){
     if(!html5QrCode) html5QrCode = new Html5Qrcode('reader');
     html5QrCode.start(
       { facingMode: 'environment' },
       { fps: 10, qrbox: { width: 260, height: 170 } },
       (decodedText)=> onScanSuccess(decodedText),
       ()=>{ /* ignore per-frame decode misses */ }
-    ).then(()=>{ scanning = true; setActiveUI(); })
-     .catch(err=>{
+    ).then(()=>{ scanning = true; engineRunning = 'qr'; setActiveUI(); })
+     .catch(()=>{
         setIdleUI();
         el('scanHint').textContent = 'Camera access needed — check browser permissions';
      });
   }
 
+  function startBarcodeEngine(){
+    Quagga.init({
+      inputStream: {
+        type: 'LiveStream',
+        target: el('reader'),
+        constraints: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+      },
+      locator: { patchSize: 'medium', halfSample: true },
+      numOfWorkers: 2,
+      frequency: 10,
+      decoder: {
+        readers: ['ean_reader','ean_8_reader','upc_reader','upc_e_reader','code_128_reader','code_39_reader','codabar_reader','i2of5_reader']
+      },
+      locate: true
+    }, function(err){
+      if(err){
+        setIdleUI();
+        el('scanHint').textContent = 'Camera access needed — check browser permissions';
+        return;
+      }
+      Quagga.offDetected(quaggaDetected);
+      Quagga.onDetected(quaggaDetected);
+      Quagga.start();
+      scanning = true; engineRunning = 'barcode'; setActiveUI();
+    });
+  }
+
+  function quaggaDetected(result){
+    if(!result || !result.codeResult || !result.codeResult.code) return;
+    onScanSuccess(result.codeResult.code);
+  }
+
   function stopScanning(){
-    if(html5QrCode && scanning){
-      html5QrCode.stop().then(()=>{
-        return html5QrCode.clear();
-      }).catch(()=>{});
+    if(engineRunning === 'qr' && html5QrCode){
+      html5QrCode.stop().then(()=> html5QrCode.clear()).catch(()=>{});
+    } else if(engineRunning === 'barcode'){
+      try{
+        Quagga.offDetected(quaggaDetected);
+        Quagga.stop();
+      }catch(e){}
+      const reader = el('reader');
+      while(reader.firstChild) reader.removeChild(reader.firstChild);
     }
+    engineRunning = null;
     scanning = false;
   }
 
@@ -579,6 +643,22 @@
     if(scanning){ stopScanning(); setIdleUI(); }
     else { startScanning(); }
   });
+
+  el('modeBarcodeBtn').addEventListener('click', ()=> switchMode('barcode'));
+  el('modeQrBtn').addEventListener('click', ()=> switchMode('qr'));
+
+  function switchMode(mode){
+    if(mode === activeEngine) return;
+    const wasScanning = scanning;
+    if(wasScanning){ stopScanning(); }
+    activeEngine = mode;
+    el('modeBarcodeBtn').classList.toggle('active', mode === 'barcode');
+    el('modeQrBtn').classList.toggle('active', mode === 'qr');
+    el('modeCaption').textContent = mode === 'barcode'
+      ? 'Dedicated 1D-barcode engine — better for UPC/EAN in real-world lighting.'
+      : 'General-purpose engine — handles QR codes and Data Matrix.';
+    if(wasScanning){ startScanning(); } else { setIdleUI(); }
+  }
 
   // Release the camera when the tab/app is backgrounded instead of letting
   // the stream die mid-scan and error out. User taps "Start Scanning" again
@@ -596,7 +676,8 @@
     beep();
     el('scanFlash').classList.add('show');
     setTimeout(()=> el('scanFlash').classList.remove('show'), 150);
-    if(html5QrCode) html5QrCode.pause(true);
+    stopScanning();
+    setIdleUI();
 
     el('scannedCodeText').textContent = text;
     el('qtyInput').value = '1';
@@ -617,7 +698,7 @@
   function closeSheet(resume){
     hide('sheetOverlay');
     pendingCode = null;
-    if(resume && html5QrCode) html5QrCode.resume();
+    if(resume) startScanning();
   }
 
   el('cancelScanBtn').addEventListener('click', ()=> closeSheet(true));
