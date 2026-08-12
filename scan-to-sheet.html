@@ -107,7 +107,7 @@
 
   /* Scanner */
   .scanner-shell{
-    position:relative;border-radius:16px;overflow:hidden;background:#000;
+    position:relative;touch-action:pan-y;border-radius:16px;overflow:hidden;background:#000;
     aspect-ratio:3/4;border:1px solid var(--line);
   }
   #reader{width:100%;height:100%;}
@@ -322,6 +322,7 @@
         <button class="btn btn-primary" id="toggleScanBtn">Start Scanning</button>
       </div>
       <div class="scan-hint" id="scanHint">Tap "Start Scanning" to open the camera</div>
+      <div class="scan-hint" id="cameraNote" style="font-size:10.5px;margin-top:5px;">QR zoom uses the phone camera hardware when supported.</div>
     </div>
 
     <div class="log-title">Recent scans</div>
@@ -709,18 +710,68 @@
   }, { passive:false });
   scannerShell.addEventListener('touchend', ()=>{ pinchStartDist = null; });
 
-  function startQrEngine(){
+  async function startQrEngine(){
     if(!html5QrCode) html5QrCode = new Html5Qrcode('reader');
-    html5QrCode.start(
-      { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
-      { fps: 10, qrbox: { width: 260, height: 170 } },
-      (decodedText)=> onScanSuccess(decodedText),
-      ()=>{ /* ignore per-frame decode misses */ }
-    ).then(()=>{ scanning = true; engineRunning = 'qr'; setActiveUI(); attachZoomControl(); })
-     .catch(()=>{
-        setIdleUI();
-        el('scanHint').textContent = 'Camera access needed — check browser permissions';
-     });
+
+    const qrConfig = {
+      fps: 12,
+      qrbox: (viewfinderWidth, viewfinderHeight) => {
+        const size = Math.floor(Math.min(viewfinderWidth, viewfinderHeight) * 0.62);
+        return { width: size, height: size };
+      },
+      aspectRatio: 1.0,
+      disableFlip: false
+    };
+
+    try{
+      // On some iPhones/mobile browsers, Html5Qrcode's direct facingMode
+      // constraint can fail to open the camera. First ask the browser for
+      // permission, then select the rear camera explicitly.
+      let cameraId = null;
+
+      if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
+        let probeStream = null;
+        try{
+          probeStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: 'environment' } },
+            audio: false
+          });
+
+          // getUserMedia permission is now granted; enumerate the actual
+          // camera devices and prefer a rear/environment camera.
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const cameras = devices.filter(d => d.kind === 'videoinput');
+          const rear = cameras.find(d =>
+            /back|rear|environment|world/i.test(d.label)
+          );
+          cameraId = (rear || cameras[0] || {}).deviceId || null;
+        }finally{
+          if(probeStream) probeStream.getTracks().forEach(t => t.stop());
+        }
+      }
+
+      const cameraSource = cameraId
+        ? { deviceId: { exact: cameraId } }
+        : { facingMode: { ideal: 'environment' } };
+
+      await html5QrCode.start(
+        cameraSource,
+        qrConfig,
+        (decodedText)=> onScanSuccess(decodedText),
+        ()=>{ /* ignore per-frame decode misses */ }
+      );
+
+      scanning = true;
+      engineRunning = 'qr';
+      setActiveUI();
+      attachZoomControl();
+
+    }catch(err){
+      console.error('QR camera start failed:', err);
+      setIdleUI();
+      el('scanHint').textContent =
+        'Camera could not open — allow camera access and use HTTPS (or localhost), then try again.';
+    }
   }
 
   function startBarcodeEngine(){
