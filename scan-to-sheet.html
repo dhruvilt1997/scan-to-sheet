@@ -366,6 +366,10 @@
   let pendingCode = null;
   let activeEngine = 'barcode'; // 'barcode' (Quagga) or 'qr' (html5-qrcode)
   let engineRunning = null;     // which engine is actually live right now
+  let confirmBuffer = [];       // recent barcode reads, used to require repeat confirmation
+  const CONFIRM_MATCHES = 3;    // identical reads needed before we accept a code
+  const CONFIRM_WINDOW = 5;     // how many recent reads we keep in the buffer
+  const MAX_AVG_ERROR = 0.12;   // Quagga's own per-read confidence — higher = noisier read, discard
 
   const el = id => document.getElementById(id);
 
@@ -593,6 +597,7 @@
   }
 
   function startBarcodeEngine(){
+    confirmBuffer = [];
     Quagga.init({
       inputStream: {
         type: 'LiveStream',
@@ -603,7 +608,8 @@
       numOfWorkers: 2,
       frequency: 10,
       decoder: {
-        readers: ['ean_reader','ean_8_reader','upc_reader','upc_e_reader','code_128_reader','code_39_reader','codabar_reader','i2of5_reader']
+        readers: ['ean_reader','ean_8_reader','upc_reader','upc_e_reader','code_128_reader','code_39_reader','codabar_reader','i2of5_reader'],
+        multiple: false
       },
       locate: true
     }, function(err){
@@ -619,9 +625,46 @@
     });
   }
 
+  // GS1 check-digit validation for EAN-13 / UPC-A / EAN-8. Barcodes of other
+  // lengths (Code128/39/Codabar) skip this and rely on the vote count alone.
+  function hasValidChecksum(code){
+    if(!/^\d+$/.test(code)) return true;
+    if(code.length !== 8 && code.length !== 12 && code.length !== 13) return true;
+    const digits = code.split('').map(Number);
+    const check = digits.pop();
+    let sum = 0;
+    digits.reverse().forEach((d,i)=>{ sum += d * (i % 2 === 0 ? 3 : 1); });
+    return ((10 - (sum % 10)) % 10) === check;
+  }
+
+  // Quagga reports a per-segment decode error on each read; average it as a
+  // rough confidence score and throw out noisy reads before they ever reach
+  // the vote buffer.
+  function averageDecodeError(result){
+    const codes = result.codeResult && result.codeResult.decodedCodes;
+    if(!codes) return 0;
+    const errors = codes.map(c=>c.error).filter(e=> typeof e === 'number');
+    if(!errors.length) return 0;
+    return errors.reduce((a,b)=>a+b,0) / errors.length;
+  }
+
   function quaggaDetected(result){
     if(!result || !result.codeResult || !result.codeResult.code) return;
-    onScanSuccess(result.codeResult.code);
+    const code = result.codeResult.code;
+
+    if(!hasValidChecksum(code)) return;              // fails GS1 check digit — definite misread
+    if(averageDecodeError(result) > MAX_AVG_ERROR) return; // low-confidence read
+
+    confirmBuffer.push(code);
+    if(confirmBuffer.length > CONFIRM_WINDOW) confirmBuffer.shift();
+
+    const matches = confirmBuffer.filter(c => c === code).length;
+    if(matches >= CONFIRM_MATCHES){
+      confirmBuffer = [];
+      onScanSuccess(code);
+    } else if(scanning){
+      el('scanHint').textContent = `Confirming… (${matches}/${CONFIRM_MATCHES})`;
+    }
   }
 
   function stopScanning(){
@@ -637,6 +680,7 @@
     }
     engineRunning = null;
     scanning = false;
+    confirmBuffer = [];
   }
 
   el('toggleScanBtn').addEventListener('click', ()=>{
